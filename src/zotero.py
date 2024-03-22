@@ -17,6 +17,7 @@ from unstructured.documents.elements import (
     TableChunk,
     Title,
 )
+import shutil
 from unstructured.partition.auto import partition
 from unstructured_inference.models.base import DEFAULT_MODEL
 from weaviate.config import AdditionalConfig
@@ -68,7 +69,7 @@ def check_misc(text):
         return True
 
 
-def extract_text(file: any, file_name, vision=False):
+def extract_text(file: any,file_name, directory,vision=False):
     # 分割文档
     elements = partition(
         file=file,
@@ -129,13 +130,20 @@ def extract_text(file: any, file_name, vision=False):
         text_list[-2] = text_list[-2] + " " + text_list[-1]
         text_list = text_list[:-1]
 
-    result_list = []
-    for text in text_list:
-        split_text = text.split("\n\n", 1)
-        if len(split_text) == 2:
-            title, _ = split_text
-        result_list.append({title: text})
-    return result_list
+     # 写入文件
+    data = fix_utf8(text_list)
+    output_dir='docs_output/'+directory
+    os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(output_dir, f"{file_name}.pkl"), "wb") as f:
+        pickle.dump(data, f)
+                    
+    # result_list = []
+    # for text in text_list:
+    #     split_text = text.split("\n\n", 1)
+    #     if len(split_text) == 2:
+    #         title, _ = split_text
+    #     result_list.append({title: text})
+    return data
 
 
 def split_chunks(text_list: list, source: str):
@@ -152,7 +160,6 @@ def chunks_add_source(text_list: list, source: str):
         chunks.append({"content": text, "source": source})
     return chunks
 
-
 # w_client = weaviate.connect_to_local(
 #     host="localhost", additional_config=AdditionalConfig(timeout=(600, 800))
 # )
@@ -162,41 +169,48 @@ def chunks_add_source(text_list: list, source: str):
 #     name="audit",
 #     vectorizer_config=wvc.config.Configure.Vectorizer.text2vec_transformers(),
 # )
-zot = zotero.Zotero(library_id=None, library_type=None, api_key=None)
+zot = zotero.Zotero('', '', '')
+docs_items = os.listdir('docs_output')
 collections = zot.all_collections()
 for collection in collections:
-    collection_key = collection["data"]["key"]
-    if collection_key in ["2GQGZZMJ", "BG678IY7"]:  # 其他废止的
+    collection_key=collection['data']['key']
+    if collection_key in ["2GQGZZMJ" ,'BG678IY7']:# 其他废止的
         continue
     items = zot.everything(zot.collection_items(collection_key))
-    for item in items:
+    for item in items: 
         if "links" in item and "attachment" in item["links"]:
-            href = item["links"]["attachment"].get("href")
+            href = item["links"]["attachment"].get('href')
             if href:
-                file_key = href.split("/")[-1]
-                file_key = item["links"]["attachment"].get("href").split("/")[-1]
-                file_name = item["data"]["nameOfAct"]
+                file_key = href.split('/')[-1]
+                file_key=item["links"]["attachment"].get('href').split('/')[-1]
+                file_name=item['data']['nameOfAct']
+                if file_name+'.pkl' in docs_items:
+                     # Assuming docs_items are file names in the current directory
+                    current_path = os.path.join('docs_output', file_name + '.pkl')
+                    target_path = os.path.join('docs_output/'+collection_key, file_name + '.pkl')
+                    
+                    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                    
+                    if os.path.exists(current_path):
+                        # Move the file to the target directory
+                        shutil.move(current_path, target_path)
+                    continue
                 # file=zot.dump(file_key)
                 # with open(file_name, "wb") as file:
                 #     # 将二进制数据写入文件
                 #     file.write(binary_data)
                 file_in_memory = io.BytesIO(zot.file(file_key))
-                contents = extract_text(file_in_memory, file_name)
-                # 写入文件
-                data = fix_utf8(contents)
-                output_dir = "docs_output"
-                os.makedirs(output_dir, exist_ok=True)
-                with open(os.path.join(output_dir, f"{file_name}.pkl"), "wb") as f:
-                    pickle.dump(data, f)
-                # 传入向量数据库
-                # file_name_without_ext = re.split(r"\.pdf$", file_name)[0]
-                # w_chunks = split_chunks(text_list=contents, source=file_name_without_ext)
+                contents = extract_text(file_in_memory,file_name,collection_key)
+            
+                # # 传入向量数据库
+                # # file_name_without_ext = re.split(r"\.pdf$", file_name)[0]
+                # w_chunks = split_chunks(text_list=contents, source=file_name)
 
                 # questions = w_client.collections.get(name="audit")
                 # questions.data.insert_many(w_chunks)
-
-    # directory = "docs_output/audit"
-
+print('ok')            
+    # directory = "docs_output"
+    
     # data_list = []
 
     # for file_path in glob.glob(os.path.join(directory, "*.pkl")):
@@ -205,16 +219,22 @@ for collection in collections:
     #     with open(file_path, "rb") as f:
     #         data = pickle.load(f)
     #         data_list.extend(data)
+        # result_list = []
+        # for text in data_list:
+        #     split_text = text.split("\n\n", 1)
+        #     if len(split_text) == 2:
+        #         title, _ = split_text
+        #     result_list.append({title: text})
+        # w_chunks = split_chunks(text_list=result_list, source=file_name)
+        # w_chunks = chunks_add_source(text_list=data_list, source=file_name_without_ext)
 
-    #     w_chunks = chunks_add_source(text_list=data_list, source=file_name_without_ext)
+        # collection = w_client.collections.get(name="audit")
+        # collection.data.insert_many(w_chunks)
 
-    #     collection = w_client.collections.get(name="audit")
-    #     collection.data.insert_many(w_chunks)
-
-    # w_client.collections.delete(name="water")
+    # w_client.collections.delete(name="audit")
 
 # finally:
-#     print('ok')
+    
 #     w_client.close()
 
 # # 定义 Zotero 集合和对应的 CSV 文件名
