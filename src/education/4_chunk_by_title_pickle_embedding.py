@@ -1,25 +1,25 @@
 import logging
 import os
 import pickle
+import boto3
+import psycopg2
 from datetime import UTC, datetime
 from io import StringIO
 
-import boto3
 import pandas as pd
-import psycopg2
 import tiktoken
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from openai import OpenAI
-from opensearchpy import OpenSearch, RequestsHttpConnection, helpers
 from pinecone import Pinecone
-from requests_aws4auth import AWS4Auth
 from tenacity import retry, stop_after_attempt, wait_fixed
+from opensearchpy import OpenSearch, RequestsHttpConnection, helpers
+from requests_aws4auth import AWS4Auth
 
 load_dotenv()
 
 logging.basicConfig(
-    filename="esg_embedding.log",
+    filename="education_embedding.log",
     level=logging.INFO,
     format="%(asctime)s:%(levelname)s:%(message)s",
     filemode="w",
@@ -27,7 +27,6 @@ logging.basicConfig(
 )
 
 client = OpenAI()
-
 region = "us-east-1"
 service = "aoss"
 credentials = boto3.Session().get_credentials()
@@ -48,34 +47,31 @@ opensearch_client = OpenSearch(
     timeout=300,
 )
 
-pc = Pinecone(api_key=os.environ.get("PINECONE_SERVERLESS_API_KEY"))
-idx = pc.Index(os.environ.get("PINECONE_SERVERLESS_INDEX_NAME"))
+pc = Pinecone(api_key=os.getenv("PINECONE_SERVERLESS_API_KEY"))
+idx = pc.Index(os.getenv("PINECONE_SERVERLESS_INDEX_NAME"))
 
 
 def num_tokens_from_string(string: str) -> int:
     """Returns the number of tokens in a text string."""
     encoding = tiktoken.get_encoding("cl100k_base")
-    num_tokens = len(encoding.encode(string))
-    return num_tokens
+    return len(encoding.encode(string))
 
 
 def fix_utf8(original_list):
     cleaned_list = []
-    for item in original_list:
-        original_str, page = item
+    for original_str in original_list:
         cleaned_str = original_str.replace("\ufffd", " ")
-        cleaned_list.append((cleaned_str, page))
+        cleaned_list.append(cleaned_str)
     return cleaned_list
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
 def get_embeddings(items, model="text-embedding-3-small"):
-    text_list = [item[0] for item in items]
+    text_list = [item for item in items]
     try:
         text_list = [text.replace("\n\n", " ").replace("\n", " ") for text in text_list]
         length = len(text_list)
         results = []
-
         for i in range(0, length, 1000):
             result = client.embeddings.create(
                 input=text_list[i : i + 1000], model=model
@@ -84,7 +80,8 @@ def get_embeddings(items, model="text-embedding-3-small"):
         return results
 
     except Exception as e:
-        print(e)
+        logging.error(f"Error generating embeddings: {e}")
+        raise
 
 
 def load_pickle_list(file_path):
@@ -126,8 +123,7 @@ def split_dataframe_table(html_table, chunk_size=8100):
 def merge_pickle_list(data):
     temp = ""
     result = []
-    for item in data:
-        d, page = item
+    for d in data:
         if num_tokens_from_string(d) > 8100:
             soup = BeautifulSoup(d, "html.parser")
             tables = soup.find_all("table")
@@ -135,23 +131,23 @@ def merge_pickle_list(data):
                 table_content = str(table)
                 if num_tokens_from_string(table_content) < 8100:
                     if table_content:  # 确保表格内容不为空
-                        result.append((table_content, page))
+                        result.append(table_content)
                 else:
                     try:
                         sub_tables = split_dataframe_table(table_content)
                         for sub_table in sub_tables:
                             if sub_table:
                                 soup = BeautifulSoup(sub_table, "html.parser")
-                                result.append((str(soup), page))
+                                result.append(str(soup))
                     except Exception as e:
-                        logging.error(e)
+                        logging.error(f"Error splitting dataframe table: {e}")
         elif num_tokens_from_string(d) < 15:
             temp += d + " "
         else:
-            result.append(((temp + d), page))
+            result.append((temp + d))
             temp = ""
     if temp:
-        result.append((temp, page))
+        result.append(temp)
 
     return result
 
@@ -160,10 +156,11 @@ def merge_pickle_list(data):
 def upsert_vectors(vectors):
     try:
         idx.upsert(
-            vectors=vectors, batch_size=200, namespace="esg", show_progress=False
+            vectors=vectors, batch_size=200, namespace="education", show_progress=False
         )
     except Exception as e:
-        logging.error(e)
+        logging.error(f"Error upserting vectors: {e}")
+        raise
 
 
 conn_pg = psycopg2.connect(
@@ -176,17 +173,18 @@ conn_pg = psycopg2.connect(
 
 with conn_pg.cursor() as cur:
     cur.execute(
-        "SELECT id FROM esg_meta WHERE uploaded_time IS NOT NULL AND embedded_time IS NULL"
+        "SELECT id, course, file_type, language FROM edu_meta WHERE upload_time IS NOT NULL AND embedding_time IS NULL"
     )
     records = cur.fetchall()
 
 ids = [record[0] for record in records]
+courses = {record[0]: record[1] for record in records}
+file_types = {record[0]: record[2] for record in records}
+languages = {record[0]: record[3] for record in records}
 
-files = [id + ".pkl" for id in ids]
+files = [str(id) + file_types[id] + ".pkl" for id in ids]
 
-dir = "esg_pickle"
-
-
+dir = "education_pickle"
 for file in files:
 
     try:
@@ -196,7 +194,9 @@ for file in files:
         data = fix_utf8(data)
         embeddings = get_embeddings(data)
 
-        file_id = file.split(".")[0]
+        file_id = file.split(".")[0]  
+        course = courses[file_id]
+        language = languages[file_id]
 
         vectors = []
         fulltext_list = []
@@ -204,12 +204,13 @@ for file in files:
             fulltext_list.append(
                 {
                     "_op_type": "index",
-                    "_index": "esg",
+                    "_index": "edu",
                     "_id": file_id + "_" + str(index),
                     "_source": {
-                        "pageNumber": data[index][1],
-                        "text": data[index][0],
-                        "reportId": file_id,
+                        "text": data[index],
+                        "docId": file_id,
+                        "course": course,
+                        "language": language,
                     },
                 }
             )
@@ -218,9 +219,10 @@ for file in files:
                     "id": file_id + "_" + str(index),
                     "values": e.embedding,
                     "metadata": {
-                        "text": data[index][0],
+                        "text": data[index],
                         "rec_id": file_id,
-                        "page_number": data[index][1],
+                        "course": course,
+                        "language": language,
                     },
                 }
             )
@@ -236,7 +238,7 @@ for file in files:
 
         with conn_pg.cursor() as cur:
             cur.execute(
-                "UPDATE esg_meta SET embedded_time = %s WHERE id = %s",
+                "UPDATE edu_meta SET embedding_time = %s WHERE id = %s",
                 (datetime.now(UTC), file_id),
             )
             conn_pg.commit()

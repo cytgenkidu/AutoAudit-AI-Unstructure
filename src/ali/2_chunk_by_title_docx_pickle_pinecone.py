@@ -3,6 +3,7 @@ import os
 import pickle
 from datetime import UTC, datetime
 from io import StringIO
+import uuid
 
 import pandas as pd
 import tiktoken
@@ -16,7 +17,7 @@ from xata import XataClient
 load_dotenv()
 
 logging.basicConfig(
-    filename="education_docx_embedding.log",
+    filename="ali_docx_embedding.log",
     level=logging.INFO,
     format="%(asctime)s:%(levelname)s:%(message)s",
     filemode="w",
@@ -26,55 +27,22 @@ logging.basicConfig(
 client = OpenAI()
 
 xata_api_key = os.getenv("XATA_API_KEY")
-xata_db_url = os.getenv("XATA_DOCS_DB_URL")
+xata_db_url = os.getenv("XATA_ALI_DB_URL")
 
 xata = XataClient(
     api_key=xata_api_key,
     db_url=xata_db_url,
 )
 
-pc = Pinecone(api_key=os.environ.get("PINECONE_SERVERLESS_API_KEY"))
-idx = pc.Index(os.environ.get("PINECONE_SERVERLESS_INDEX_NAME"))
 
-
-def fetch_all_records(xata, table_name, columns, filter, page_size=1000):
-    all_records = []
-    cursor = None
-    more = True
-
-    while more:
-        page = {"size": page_size}
-        if not cursor:
-            results = xata.data().query(
-                table_name,
-                {
-                    "page": page,
-                    "columns": columns,
-                    "filter": filter,
-                },
-            )
-        else:
-            page["after"] = cursor
-            results = xata.data().query(
-                table_name,
-                {
-                    "page": page,
-                    "columns": columns,
-                },
-            )
-
-        all_records.extend(results["records"])
-        cursor = results["meta"]["page"]["cursor"]
-        more = results["meta"]["page"]["more"]
-
-    return all_records
+pc = Pinecone(api_key=os.getenv("PINECONE_SERVERLESS_API_KEY"))
+idx = pc.Index(os.getenv("PINECONE_SERVERLESS_INDEX_NAME"))
 
 
 def num_tokens_from_string(string: str) -> int:
     """Returns the number of tokens in a text string."""
     encoding = tiktoken.get_encoding("cl100k_base")
-    num_tokens = len(encoding.encode(string))
-    return num_tokens
+    return len(encoding.encode(string))
 
 
 def fix_utf8(original_list):
@@ -92,7 +60,6 @@ def get_embeddings(items, model="text-embedding-3-small"):
         text_list = [text.replace("\n\n", " ").replace("\n", " ") for text in text_list]
         length = len(text_list)
         results = []
-
         for i in range(0, length, 1000):
             result = client.embeddings.create(
                 input=text_list[i : i + 1000], model=model
@@ -101,10 +68,8 @@ def get_embeddings(items, model="text-embedding-3-small"):
         return results
 
     except Exception as e:
-        print(e)
-
-
-# [Embedding(embedding=[], index=0, object='embedding'),Embedding(embedding=[], index=0, object='embedding')]
+        logging.error(f"Error generating embeddings: {e}")
+        raise
 
 
 def load_pickle_list(file_path):
@@ -163,7 +128,7 @@ def merge_pickle_list(data):
                                 soup = BeautifulSoup(sub_table, "html.parser")
                                 result.append(str(soup))
                     except Exception as e:
-                        logging.error(e)
+                        logging.error(f"Error splitting dataframe table: {e}")
         elif num_tokens_from_string(d) < 15:
             temp += d + " "
         else:
@@ -179,60 +144,59 @@ def merge_pickle_list(data):
 def upsert_vectors(vectors):
     try:
         idx.upsert(
-            vectors=vectors, batch_size=200, namespace="education", show_progress=False
+            vectors=vectors, batch_size=200, namespace="ali", show_progress=False
         )
     except Exception as e:
-        logging.error(e)
+        logging.error(f"Error upserting vectors: {e}")
+        raise
 
 
-table_name = "education"
-columns = ["id","course"]
-filter = {"$all": [{"$notExists": "embedding_time"}]}
-
-all_records = fetch_all_records(xata, table_name, columns, filter)
-
-ids = [record["id"] for record in all_records]
-
-files = [id + ".pkl" for id in ids]
-
-dir = "education_pickle"
+dir = "test/pickle"
 
 files_in_dir = os.listdir(dir)
 
-for file in files_in_dir:
+# Filter out files with ".docx" in their names
+docx_files_in_dir = [file for file in files_in_dir if ".docx" in file]
 
-    try:
-        file_path = os.path.join(dir, file)
-        data = load_pickle_list(file_path)
-        data = merge_pickle_list(data)
-        data = fix_utf8(data)
-        embeddings = get_embeddings(data)
+# Remove ".docx.pkl" from the file names for further processing
+files_without_extension = [file.replace(".docx.pkl", "") for file in docx_files_in_dir]
 
-        file_id = file.split(".")[0]
+for file_without_extension in files_without_extension:
 
-        vectors = []
-        for index, e in enumerate(embeddings):
-            vectors.append(
+    file_path = os.path.join(dir, file_without_extension + ".docx.pkl")
+
+    data = load_pickle_list(file_path)
+    data = merge_pickle_list(data)
+    data = fix_utf8(data)
+    embeddings = get_embeddings(data)
+
+    file_id = file_without_extension
+
+    vectors = []
+    fulltext_list = []
+    for index, e in enumerate(embeddings):
+        vectors.append(
+            {
+                "id": uuid.uuid4().hex,
+                "values": e.embedding,
+                "metadata": {
+                    "text": data[index],
+                    "title": file_id,
+                },
+            }
+        )
+        fulltext_list.append(
                 {
-                    "id": file_id + "_" + str(index),
-                    "values": e.embedding,
-                    "metadata": {
-                        "text": data[index],
-                        "rec_id": file_id,
-                        "course": all_records[ids.index(file_id)]["course"],
-
-                    },
+                    "text": data[index],
+                    "title": file_id,
                 }
             )
 
-        upsert_vectors(vectors)
+    upsert_vectors(vectors)
 
-        embedded = xata.records().update(
-            "education", file_id, {"embedding_time": datetime.now(UTC).isoformat()}
-        )
+    n = len(fulltext_list)
+    for i in range(0, n, 500):
+        batch = fulltext_list[i : i + 500]
+        result = xata.records().bulk_insert("fulltext", {"records": batch})
 
-        logging.info(f"{file_id} embedding finished")
-
-    except Exception as e:
-        logging.error(e)
-        continue
+    logging.info(f"Embedding finished for file_id: {file_id}")

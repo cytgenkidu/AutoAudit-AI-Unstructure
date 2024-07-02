@@ -37,9 +37,19 @@ def extract_text(file_name: str):
         else:
             element_text.append(str(slide_elements))
 
-        combined_text = f"Page: {i+1}\n{slide_text.strip()}\n\n{notes_text.strip()}\n\n{' '.join(element_text)}"
+        combined_text = (
+            f"{slide_text.strip()}\n\n{notes_text.strip()}\n\n{' '.join(element_text)}"
+        )
+        slide_title = slide_text.strip().split("\n")[0] if slide_text.strip() else ""
+        base_name = os.path.splitext(os.path.basename(file_name))[0]
 
-        result_list.append(combined_text)
+        result_list.append(
+            {
+                "title": slide_title,
+                "content": combined_text,
+                "source": f"{base_name} - Slide {i+1}",
+            }
+        )
 
     return result_list
 
@@ -49,16 +59,16 @@ def process_pptx(file_path):
 
     text_list = extract_text(file_path)
 
-    with open("education_pickle/" + record_id + ".pptx" + ".pkl", "wb") as f:
+    with open("pickle/" + record_id + ".pkl", "wb") as f:
         pickle.dump(text_list, f)
 
     text_str = "\n----------\n".join(map(str, text_list))
 
-    with open("education_txt/" + record_id + ".pptx" + ".txt", "w") as f:
+    with open("txt/" + record_id + ".txt", "w") as f:
         f.write(text_str)
 
 
-directory = "docs/education"
+directory = "test"
 pptx_files = glob.glob(os.path.join(directory, "*.pptx"))
 
 with concurrent.futures.ProcessPoolExecutor(max_workers=6) as executor:
